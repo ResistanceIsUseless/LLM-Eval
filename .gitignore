@@ -41,4 +41,3 @@ Thumbs.db
 # Project specific
 tmp/
 ./tmp/
-results/*.db
