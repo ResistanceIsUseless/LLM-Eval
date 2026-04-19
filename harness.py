@@ -125,6 +125,7 @@ class BackendType(Enum):
     ANTHROPIC = "anthropic"
     OPENROUTER = "openrouter"
     NVIDIA = "nvidia"
+    COPILOT = "copilot"
 
 
 class RefusalLevel(Enum):
@@ -174,6 +175,8 @@ class BackendConfig:
     extra_body: dict = field(default_factory=dict)
     max_retries: int = 3
     timeout: int = 120  # seconds
+    # skip_load: when True, skip JIT model loading for LM Studio (assume model is ready)
+    skip_load: bool = False
 
 
 @dataclass
@@ -2097,7 +2100,8 @@ class TestHarness:
 
     def __init__(self, models: list[BackendConfig], judge_config: BackendConfig,
                  categories: Optional[list[str]] = None, max_prompts: Optional[int] = None,
-                 quick_mode: bool = False, km_only: bool = False, tool_only: bool = False):
+                 quick_mode: bool = False, km_only: bool = False, tool_only: bool = False,
+                 rapid_mode: bool = False):
         self.models = models
         self.client = LLMClient()
         self.judge = OpusJudge(self.client, judge_config)
@@ -2117,10 +2121,20 @@ class TestHarness:
         else:
             self.prompts = all_prompts
 
+        # --rapid: single simplest prompt for ultra-fast model verification.
+        # Ideal for quickly checking if a model works before full evaluation.
+        # Takes precedence over all other filtering modes.
+        if rapid_mode:
+            _DIFF_ORDER = {"beginner": 0, "intermediate": 1, "advanced": 2}
+            eligible = [p for p in self.prompts if not p.is_kobayashi and not p.tool_schemas]
+            eligible.sort(key=lambda p: _DIFF_ORDER.get(p.difficulty.value, 9))
+            self.prompts = [eligible[0]] if eligible else self.prompts[:1]
+            _print(f"[cyan]--rapid: 1 prompt (fastest verification mode)[/cyan]")
+
         # --km-only: run only Kobayashi Maru impossible-task prompts.
         # Focused hallucination/abstention check without the full suite.
         # Mutually exclusive with --quick (km-only takes precedence if both set).
-        if km_only:
+        elif km_only:
             self.prompts = [p for p in self.prompts if p.is_kobayashi]
             _print(f"[yellow]--km-only: {len(self.prompts)} KM prompts selected[/yellow]")
 
@@ -2160,8 +2174,9 @@ class TestHarness:
     _BACKEND_RUN_ORDER = {
         BackendType.NVIDIA:     0,
         BackendType.OPENROUTER: 1,
-        BackendType.ANTHROPIC:  2,
-        BackendType.LM_STUDIO:  3,
+        BackendType.COPILOT:    2,
+        BackendType.ANTHROPIC:  3,
+        BackendType.LM_STUDIO:  4,
     }
 
     def run(self) -> list[TestResult]:
@@ -2231,7 +2246,8 @@ class TestHarness:
                     progress.update(overall_task, description=short)
 
                 # JIT load for LM Studio — must be ready before first prompt.
-                if model_config.backend_type == BackendType.LM_STUDIO:
+                # Skip loading if skip_load is set (--current-model mode).
+                if model_config.backend_type == BackendType.LM_STUDIO and not model_config.skip_load:
                     ready = wait_for_lm_studio_model_ready(
                         base_url=model_config.base_url,
                         api_key=model_config.api_key,
@@ -2242,6 +2258,8 @@ class TestHarness:
                         if RICH_AVAILABLE:
                             progress.update(overall_task, advance=n_prompts)
                         continue
+                elif model_config.skip_load:
+                    log(f"  [cyan]→ Skipping model load (--current-model mode)[/cyan]")
 
                 for i, prompt in enumerate(self.prompts):
                     # Generate fresh dynamic variables for each prompt execution
@@ -2973,7 +2991,7 @@ def wait_for_lm_studio_model_ready(
     api_key: str,
     model_id: str,
     timeout_s: int = 180,
-    poll_interval_s: int = 5,
+    poll_interval_s: int = 2,
 ) -> bool:
     """
     Request JIT model loading in LM Studio and poll until the model is ready.
@@ -3067,6 +3085,101 @@ def wait_for_lm_studio_model_ready(
     return False
 
 
+def get_currently_loaded_lm_studio_model(base_url: str, api_key: str) -> Optional[str]:
+    """
+    Query LM Studio for the currently loaded model.
+    
+    LM Studio typically only loads one model at a time. This function queries
+    the /v1/models endpoint and returns the first non-embedding model found,
+    or None if no model is loaded or LM Studio is unreachable.
+    """
+    _EMBEDDING_PATTERNS = (
+        "embed", "embedding", "rerank", "clip", "e5-", "bge-",
+        "nomic-embed", "all-minilm", "instructor-",
+    )
+    try:
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=5)
+        models = client.models.list()
+        for m in models.data:
+            model_type = getattr(m, "type", "") or ""
+            is_embedding = (
+                model_type == "embedding"
+                or any(pat in m.id.lower() for pat in _EMBEDDING_PATTERNS)
+            )
+            if not is_embedding:
+                return m.id
+    except Exception as e:
+        _print(f"[yellow]Could not query LM Studio models: {e}[/yellow]")
+    return None
+
+
+def unload_all_lm_studio_models(base_url: str) -> int:
+    """
+    Unload all currently loaded models from LM Studio to free VRAM.
+    
+    This helps prevent system lockups when switching between large models
+    by ensuring VRAM is fully cleared before loading a new model.
+    
+    Uses the native LM Studio API at /api/v1/models to discover loaded
+    instances and /api/v1/models/unload to eject them.
+    
+    Args:
+        base_url: LM Studio OpenAI-compat base URL (e.g. http://localhost:1234/v1)
+        
+    Returns:
+        Number of models unloaded.
+    """
+    import urllib.request
+    import urllib.error
+    
+    # Derive native API base (strip /v1 suffix)
+    native_base = base_url.rstrip("/")
+    if native_base.endswith("/v1"):
+        native_base = native_base[:-3]
+    
+    models_url = f"{native_base}/api/v1/models"
+    unload_url = f"{native_base}/api/v1/models/unload"
+    
+    # Get list of all models and their loaded instances
+    try:
+        req = urllib.request.Request(models_url, method="GET")
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read().decode())
+    except Exception as e:
+        _print(f"[yellow]Could not query LM Studio models for unload: {e}[/yellow]")
+        return 0
+    
+    # Collect all loaded instance IDs
+    loaded_instances = []
+    for model in data.get("models", []):
+        for instance in model.get("loaded_instances", []):
+            instance_id = instance.get("id")
+            if instance_id:
+                loaded_instances.append((model.get("key", "unknown"), instance_id))
+    
+    if not loaded_instances:
+        return 0
+    
+    # Unload each instance
+    unloaded = 0
+    for model_key, instance_id in loaded_instances:
+        try:
+            payload = json.dumps({"instance_id": instance_id}).encode()
+            req = urllib.request.Request(
+                unload_url,
+                data=payload,
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            urllib.request.urlopen(req, timeout=30)
+            _print(f"  [cyan]Unloaded: {model_key}[/cyan]")
+            unloaded += 1
+        except Exception as e:
+            _print(f"  [yellow]Failed to unload {model_key}: {e}[/yellow]")
+    
+    return unloaded
+
+
 def build_backend_configs(args) -> tuple[list[BackendConfig], BackendConfig]:
     """
     Build model configs from environment variables and CLI args.
@@ -3080,7 +3193,23 @@ def build_backend_configs(args) -> tuple[list[BackendConfig], BackendConfig]:
         lm_url = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
         lm_key = os.getenv("LM_STUDIO_API_KEY", "lm-studio")
 
-        if hasattr(args, 'lm_models') and args.lm_models:
+        # --current-model: Only test the currently loaded LM Studio model (no loading/unloading)
+        current_model_mode = getattr(args, 'current_model', False)
+        if current_model_mode:
+            current = get_currently_loaded_lm_studio_model(lm_url, lm_key)
+            if current:
+                _print(f"[cyan]--current-model: Using currently loaded model '{current}'[/cyan]")
+                configs.append(BackendConfig(
+                    backend_type=BackendType.LM_STUDIO,
+                    model_id=current,
+                    base_url=lm_url,
+                    api_key=lm_key,
+                    skip_load=True,  # Signal to skip JIT loading
+                ))
+            else:
+                _print("[red]--current-model: No model currently loaded in LM Studio[/red]")
+
+        elif hasattr(args, 'lm_models') and args.lm_models:
             # User specified models explicitly
             for model_id in args.lm_models:
                 configs.append(BackendConfig(
@@ -3216,9 +3345,43 @@ def build_backend_configs(args) -> tuple[list[BackendConfig], BackendConfig]:
         else:
             _print("[yellow]NVIDIA NIM: No API key found. Set NVIDIA_API_KEY in .env[/yellow]")
 
+    # --- GitHub Copilot ---
+    # Uses the OpenAI-compatible endpoint at api.githubcopilot.com.
+    # Requires a GitHub Copilot subscription and a valid token obtained via
+    # GitHub CLI: gh auth token (must have copilot scope).
+    # Available models include gpt-4o, claude-sonnet-4-20250514, o3-mini, gemini-2.0-flash, etc.
+    if not backends_filter or "copilot" in backends_filter:
+        copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+        copilot_url = os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com")
+        if copilot_key:
+            # Model resolution priority:
+            #   1. --copilot-models CLI flag
+            #   2. COPILOT_MODELS in .env (comma-separated)
+            #   3. Hardcoded defaults below
+            copilot_models = ["gpt-4o", "claude-sonnet-4-20250514"]
+            env_copilot_models = os.getenv("COPILOT_MODELS", "").strip()
+            if env_copilot_models:
+                copilot_models = [m.strip() for m in env_copilot_models.split(",") if m.strip()]
+            if hasattr(args, 'copilot_models') and args.copilot_models:
+                copilot_models = args.copilot_models
+            for model_id in copilot_models:
+                configs.append(BackendConfig(
+                    backend_type=BackendType.COPILOT,
+                    model_id=model_id,
+                    base_url=copilot_url,
+                    api_key=copilot_key,
+                    extra_headers={
+                        "Copilot-Integration-Id": "vscode-chat",
+                    },
+                ))
+            _print(f"[green]GitHub Copilot: {len(copilot_models)} model(s) configured[/green]")
+        else:
+            _print("[yellow]GitHub Copilot: No token found. Set GITHUB_COPILOT_TOKEN or GITHUB_TOKEN in .env[/yellow]")
+            _print("[yellow]  Tip: Run 'gh auth token' to get a token (requires Copilot subscription)[/yellow]")
+
     # --- Judge config ---
     # Configurable via JUDGE_BACKEND and JUDGE_MODEL in .env.
-    # Supported backends: anthropic, openrouter, nvidia, lm_studio
+    # Supported backends: anthropic, openrouter, nvidia, lm_studio, copilot
     # The judge must be a strong instruction-following model capable of structured
     # JSON output. Anthropic Opus is the default and recommended choice.
     judge_backend = os.getenv("JUDGE_BACKEND", "anthropic")
@@ -3282,8 +3445,23 @@ def build_backend_configs(args) -> tuple[list[BackendConfig], BackendConfig]:
             api_key=lm_key,
         )
 
+    elif judge_backend == "copilot":
+        # GitHub Copilot judge — uses the OpenAI-compatible API.
+        copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if not copilot_key:
+            _print("[red]ERROR: GITHUB_COPILOT_TOKEN or GITHUB_TOKEN required for copilot judge backend.[/red]")
+            sys.exit(1)
+        copilot_url = os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com")
+        judge_config = BackendConfig(
+            backend_type=BackendType.COPILOT,
+            model_id=judge_model,
+            base_url=copilot_url,
+            api_key=copilot_key,
+            extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+        )
+
     else:
-        valid = "anthropic, openrouter, nvidia, lm_studio"
+        valid = "anthropic, openrouter, nvidia, lm_studio, copilot"
         _print(f"[red]ERROR: Unknown judge backend '{judge_backend}'. Valid options: {valid}[/red]")
         sys.exit(1)
 
@@ -3326,10 +3504,16 @@ def run_preflight_check(
     """
     Probe all configured backends and display a status table.
 
-    Judge fallback chain:
-      1. Configured judge (Anthropic by default)
-      2. z-ai/glm5 on NVIDIA NIM — auto-excluded from test subjects if promoted
-      3. Abort if neither is reachable
+    Judge fallback chain (tried in order if primary fails):
+      1. Configured judge (Anthropic Opus by default)
+      2. z-ai/glm5 on NVIDIA NIM
+      3. gpt-4o on GitHub Copilot
+      4. claude-sonnet-4-20250514 on GitHub Copilot
+      5. claude-sonnet-4 on OpenRouter
+      6. claude-sonnet-4-5 on Anthropic (if not already the primary)
+      
+    The first working fallback becomes the judge and is auto-excluded from
+    test subjects to avoid self-evaluation.
 
     LM Studio models are not individually probed (would trigger JIT loading);
     they are marked as "local — load on demand" and kept in the test list.
@@ -3420,38 +3604,126 @@ def run_preflight_check(
                  "lm_studio", "local", "load on demand")
 
     # ── Judge fallback ─────────────────────────────────────────────────────
+    # Try a chain of fallback judges if the primary is unreachable.
+    # Order: NVIDIA GLM5 → Copilot GPT-4o → OpenRouter Claude → Anthropic Claude
+    # The first working backend becomes the judge and is excluded from test subjects.
     working_judge = judge_config if judge_result["ok"] else None
+    fallback_judge_label = None  # Track which fallback was used
 
     if not working_judge:
         _print(f"[yellow]Primary judge ({judge_config.model_id}) is not reachable.[/yellow]")
 
-        # Try GLM5 on NVIDIA as fallback judge
+        # Build fallback candidates in priority order
+        # Each entry: (BackendConfig or None, description)
+        fallback_candidates = []
+
+        # 1. GLM5 on NVIDIA (if configured in test_configs)
         glm5 = next(
             (c for c in test_configs
              if c.backend_type == BackendType.NVIDIA and c.model_id == "z-ai/glm5"),
             None,
         )
         if glm5:
-            glm5_result = _probe_cloud_model(glm5, client)
-            if glm5_result["ok"]:
-                _print("[yellow]⚠  Falling back to z-ai/glm5 (NVIDIA) as judge.[/yellow]")
-                _print("[yellow]   GLM5 will be excluded from test subjects to avoid self-evaluation.[/yellow]")
-                working_judge = glm5
-            else:
-                _print(f"[red]GLM5 fallback also failed: {glm5_result['error'][:60]}[/red]")
+            fallback_candidates.append((glm5, "z-ai/glm5 (NVIDIA)"))
         else:
-            _print("[red]No GLM5 fallback available. Set NVIDIA_API_KEY to enable it.[/red]")
+            # Try to create a GLM5 config if NVIDIA_API_KEY is available
+            nv_key = os.getenv("NVIDIA_API_KEY")
+            if nv_key and not nv_key.startswith("nvapi-your"):
+                nv_url = os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1")
+                fallback_candidates.append((
+                    BackendConfig(
+                        backend_type=BackendType.NVIDIA,
+                        model_id="z-ai/glm5",
+                        base_url=nv_url,
+                        api_key=nv_key,
+                    ),
+                    "z-ai/glm5 (NVIDIA)"
+                ))
+
+        # 2. GitHub Copilot GPT-4o
+        copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if copilot_key:
+            copilot_url = os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com")
+            fallback_candidates.append((
+                BackendConfig(
+                    backend_type=BackendType.COPILOT,
+                    model_id="gpt-4o",
+                    base_url=copilot_url,
+                    api_key=copilot_key,
+                    extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+                ),
+                "gpt-4o (Copilot)"
+            ))
+            # Also try Claude on Copilot
+            fallback_candidates.append((
+                BackendConfig(
+                    backend_type=BackendType.COPILOT,
+                    model_id="claude-sonnet-4-20250514",
+                    base_url=copilot_url,
+                    api_key=copilot_key,
+                    extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+                ),
+                "claude-sonnet-4-20250514 (Copilot)"
+            ))
+
+        # 3. OpenRouter Claude
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if or_key and not or_key.startswith("sk-or-v1-your"):
+            or_url = os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1")
+            fallback_candidates.append((
+                BackendConfig(
+                    backend_type=BackendType.OPENROUTER,
+                    model_id="anthropic/claude-sonnet-4",
+                    base_url=or_url,
+                    api_key=or_key,
+                    extra_headers={
+                        "HTTP-Referer": "https://security-harness.local",
+                        "X-Title": "LLM-Security-Harness",
+                    },
+                ),
+                "claude-sonnet-4 (OpenRouter)"
+            ))
+
+        # 4. Anthropic Claude (if not already the primary that failed)
+        anthropic_key = os.getenv("ANTHROPIC_API_KEY")
+        if anthropic_key and not anthropic_key.startswith("sk-ant-your"):
+            if judge_config.backend_type != BackendType.ANTHROPIC:
+                fallback_candidates.append((
+                    BackendConfig(
+                        backend_type=BackendType.ANTHROPIC,
+                        model_id="claude-sonnet-4-5-20250929",
+                        api_key=anthropic_key,
+                    ),
+                    "claude-sonnet-4-5 (Anthropic)"
+                ))
+
+        # Try each fallback in order
+        for fallback_config, fallback_desc in fallback_candidates:
+            _print(f"[yellow]Trying fallback judge: {fallback_desc}...[/yellow]")
+            fallback_result = _probe_cloud_model(fallback_config, client)
+            if fallback_result["ok"]:
+                _print(f"[green]✓ Falling back to {fallback_desc} as judge.[/green]")
+                working_judge = fallback_config
+                fallback_judge_label = f"{fallback_config.backend_type.value}:{fallback_config.model_id}"
+                break
+            else:
+                _print(f"[red]  ✗ {fallback_desc} failed: {fallback_result['error'][:50]}[/red]")
+
+        if not working_judge:
+            _print("[red]All judge fallbacks exhausted. No working judge available.[/red]")
 
     # ── Filter live test models ────────────────────────────────────────────
     # Remove cloud models that failed probe. Keep LM Studio (checked at load time).
-    # If GLM5 is now the judge, exclude it from test subjects.
+    # If a fallback judge was promoted from test subjects, exclude it.
     dead_labels = {
         f"{c.backend_type.value}:{c.model_id}"
         for c in cloud_test_configs
         if not probe_results.get(f"{c.backend_type.value}:{c.model_id}", {}).get("ok")
     }
-    if working_judge and working_judge.backend_type == BackendType.NVIDIA:
-        dead_labels.add(f"nvidia:{working_judge.model_id}")  # exclude judge from test set
+    # Exclude the fallback judge from test set to avoid self-evaluation
+    if fallback_judge_label:
+        dead_labels.add(fallback_judge_label)
+        _print(f"[yellow]Excluding judge ({fallback_judge_label}) from test subjects.[/yellow]")
 
     live_configs = [
         c for c in test_configs
@@ -3651,12 +3923,23 @@ def cmd_run(args):
         _print("[red]No models configured. Check your .env file and backend availability.[/red]")
         sys.exit(1)
 
+    # --- Clear VRAM: unload all LM Studio models before starting ---
+    # This helps prevent system lockups when switching between large models.
+    if getattr(args, 'clear_vram', False):
+        lm_url = os.getenv("LM_STUDIO_BASE_URL", "http://localhost:1234/v1")
+        _print("[cyan]Clearing VRAM: unloading all LM Studio models...[/cyan]")
+        n_unloaded = unload_all_lm_studio_models(lm_url)
+        if n_unloaded > 0:
+            _print(f"[green]Unloaded {n_unloaded} model(s) from LM Studio[/green]")
+        else:
+            _print("[yellow]No models were loaded in LM Studio[/yellow]")
+
     # --- Pre-flight: probe all backends, apply judge fallback, filter dead models ---
     live_configs, working_judge = run_preflight_check(configs, judge_config, LLMClient())
 
     if not working_judge:
         _print("[red]No working judge backend found. Cannot score responses.[/red]")
-        _print("[red]Options: top up Anthropic credits, add NVIDIA_API_KEY for GLM5 fallback.[/red]")
+        _print("[red]Set one of: ANTHROPIC_API_KEY, NVIDIA_API_KEY, GITHUB_COPILOT_TOKEN, OPENROUTER_API_KEY[/red]")
         sys.exit(1)
 
     if not live_configs:
@@ -3668,6 +3951,7 @@ def cmd_run(args):
     quick_mode  = getattr(args, 'quick',     False)
     km_only     = getattr(args, 'km_only',   False)
     tool_only   = getattr(args, 'tool_only', False)
+    rapid_mode  = getattr(args, 'rapid',     False)
 
     harness = TestHarness(
         models=live_configs,
@@ -3677,6 +3961,7 @@ def cmd_run(args):
         quick_mode=quick_mode,
         km_only=km_only,
         tool_only=tool_only,
+        rapid_mode=rapid_mode,
     )
 
     results = harness.run()
@@ -4371,9 +4656,13 @@ Examples:
   python harness.py check                                    # probe all backends before running
   python harness.py run                                      # full run, all backends
   python harness.py run --quick                              # 1 prompt per category (fast smoke test)
+  python harness.py run --rapid --current-model              # instant test of current LM Studio model (1 prompt, no load)
+  python harness.py run --current-model                      # test current LM Studio model without loading
+  python harness.py run --clear-vram                         # unload all LM Studio models before starting
   python harness.py run --km-only                            # Kobayashi Maru prompts only
   python harness.py run --tool-only                          # agentic tool-use prompts only
   python harness.py run --backends lm_studio anthropic
+  python harness.py run --backends copilot --copilot-models gpt-4o claude-sonnet-4-20250514
   python harness.py run --backends lm_studio --max-prompts 3
   python harness.py run --note "thinking-off" --backends nvidia
   python harness.py run --categories vuln_analysis exploit_dev
@@ -4390,7 +4679,7 @@ Examples:
     # --- run ---
     run_parser = subparsers.add_parser("run", help="Execute test harness")
     run_parser.add_argument("--backends", nargs="+",
-                           choices=["lm_studio", "anthropic", "openrouter", "nvidia"],
+                           choices=["lm_studio", "anthropic", "openrouter", "nvidia", "copilot"],
                            help="Backends to test (default: all configured)")
     run_parser.add_argument("--categories", nargs="+",
                            choices=[c.value for c in TestCategory],
@@ -4404,12 +4693,22 @@ Examples:
                            help="Specific OpenRouter model IDs to test")
     run_parser.add_argument("--nvidia-models", nargs="+",
                            help="Specific NVIDIA NIM model IDs to test")
+    run_parser.add_argument("--copilot-models", nargs="+",
+                           help="Specific GitHub Copilot model IDs to test (e.g. gpt-4o, claude-sonnet-4-20250514)")
     run_parser.add_argument("--max-prompts", type=int, metavar="N",
                            help="Limit to first N prompts per model (useful for smoke tests)")
     run_parser.add_argument("--quick", action="store_true",
                            help="Quick mode: 1 non-KM prompt per category at lowest difficulty. "
                                 "Fast cross-domain smoke test (~6-7 prompts). "
                                 "Mutually exclusive with --km-only.")
+    run_parser.add_argument("--rapid", action="store_true",
+                           help="Rapid mode: single simplest prompt for ultra-fast verification. "
+                                "Best combined with --current-model for instant model checks. "
+                                "Takes precedence over --quick, --km-only, --tool-only.")
+    run_parser.add_argument("--current-model", action="store_true",
+                           help="Test only the currently loaded LM Studio model (no loading/unloading). "
+                                "Skips the JIT model load step for instant execution. "
+                                "Ideal for rapid iteration when swapping models in LM Studio UI.")
     run_parser.add_argument("--km-only", action="store_true",
                            help="Run only Kobayashi Maru impossible-task prompts. "
                                 "Focused hallucination/abstention check. "
@@ -4418,6 +4717,9 @@ Examples:
                            help="Run only agentic tool-use prompts (those with tool_schemas set). "
                                 "Validates the tool-calling loop in isolation. "
                                 "Mutually exclusive with --quick and --km-only.")
+    run_parser.add_argument("--clear-vram", action="store_true",
+                           help="Unload all LM Studio models before starting to free VRAM. "
+                                "Helps prevent system lockups when switching between large models.")
     run_parser.add_argument("--note", type=str, default="",
                            help="Optional label saved with this run in score history "
                                 "(e.g. 'thinking-off', 'post-prompt-tuning')")
@@ -4427,12 +4729,12 @@ Examples:
         "check", help="Probe all backends and show availability (no run started)"
     )
     check_parser.add_argument("--backends", nargs="+",
-                              choices=["lm_studio", "anthropic", "openrouter", "nvidia"])
+                              choices=["lm_studio", "anthropic", "openrouter", "nvidia", "copilot"])
 
     # --- list-models ---
     list_parser = subparsers.add_parser("list-models", help="List available models")
     list_parser.add_argument("--backends", nargs="+",
-                            choices=["lm_studio", "anthropic", "openrouter", "nvidia"])
+                            choices=["lm_studio", "anthropic", "openrouter", "nvidia", "copilot"])
 
     # --- report ---
     report_parser = subparsers.add_parser("report", help="Generate report from results")
