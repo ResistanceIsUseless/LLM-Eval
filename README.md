@@ -119,6 +119,35 @@ python harness.py history --model glm5
 python harness.py history --runs 5
 ```
 
+### Task Profiles & Standalone Evals
+
+```bash
+# Generate profiles.yaml for zoidberg's LLM router
+python harness.py emit-profiles --out ~/.zoidberg/profiles.yaml
+
+# XBOW validation benchmark (web vulnerability validation)
+python harness.py eval-xbow --models claude-sonnet-4-6 gpt-5
+
+# AIRTBench alignment benchmark (security decision-making)
+python harness.py eval-airtbench --models claude-sonnet-4-6 gpt-5
+
+# Chain-argument extraction (goal → chain + args)
+python harness.py eval-chain-args --models claude-sonnet-4-6
+
+# Finding validation judgment (confirmed/unconfirmed/needs-review)
+python harness.py eval-finding-judgment --models claude-haiku-4-5-20251001
+
+# Solver restart summary (session log → faithful summary, Opus-as-Judge scored)
+python harness.py eval-solver-summary --models claude-haiku-4-5-20251001
+```
+
+Standalone evals can also be run directly:
+
+```bash
+python -m evals.xbow_validation --models claude-sonnet-4-6
+python -m evals.airtbench_alignment --models claude-sonnet-4-6
+```
+
 ---
 
 ## Configuration
@@ -425,6 +454,33 @@ TestPrompt(
 ```
 
 Dynamic variables are re-randomized on every run (IPs, hostnames, usernames, kernel versions). This prevents models from matching memorized CTF solutions and forces genuine reasoning.
+
+---
+
+## Task Profiles & Zoidberg Integration
+
+LLM-Eval publishes `profiles.yaml` — a mapping of security task types to optimal models — consumed by [zoidberg](https://github.com/ResistanceIsUseless/zoidberg)'s LLM router. Each profile specifies a primary model, fallback chain, and per-call cost ceiling.
+
+```bash
+python harness.py emit-profiles --out ~/.zoidberg/profiles.yaml
+```
+
+The script reads harness scores from `results/scores.db` and cross-reference benchmark results (XBOW, AIRTBench) to pick the best model per task profile. See [docs/TASK_PROFILES.md](docs/TASK_PROFILES.md) for the full taxonomy (13 profiles across 4 phases).
+
+### Cross-Reference Benchmarks
+
+| Benchmark | What it measures | Output |
+|-----------|-----------------|--------|
+| **XBOW Validation** | Web vulnerability validation (TP/FP/FN rates) against 104 challenges | `results/xbow_results.json` |
+| **AIRTBench** | Security decision-making: triage, attack paths, remediation, false positive filtering | `results/airtbench_results.json` |
+
+### Phase 2 Evals
+
+| Eval | What it measures | Output |
+|------|-----------------|--------|
+| **Chain-Arg Extraction** | Can the model pick the right chain and extract args from a free-text goal? | `results/chain_arg_results.json` |
+| **Finding Validation Judgment** | Can it classify findings as confirmed/unconfirmed/needs-review from validator output? | `results/finding_judgment_results.json` |
+| **Solver Restart Summary** | Can it summarize a long session log faithfully for restart context? | `results/solver_summary_results.json` |
 
 ---
 
