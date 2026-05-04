@@ -263,11 +263,7 @@ def evaluate_challenge(challenge: AIRTChallenge, model_id: str,
 
     start = time.monotonic()
     try:
-        response = client.send_prompt(
-            config=backend_config,
-            prompt=prompt,
-            system_prompt=system_prompt,
-        )
+        response = client.chat(config=backend_config, system=system_prompt, user=prompt)
         latency = (time.monotonic() - start) * 1000
 
         content = response.content.strip()

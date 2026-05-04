@@ -3476,61 +3476,75 @@ def build_backend_configs_for_models(model_ids: list[str],
 
     Tries each configured backend to find a matching model. Returns one
     BackendConfig per model ID that has a reachable backend.
+
+    When --backends is specified, only those backends are considered.
+    Otherwise, the model ID is heuristically matched to a backend.
     """
+    def _allowed(bt: str) -> bool:
+        return not backends or bt in backends
+
+    def _or_config(model_id: str) -> BackendConfig | None:
+        or_key = os.getenv("OPENROUTER_API_KEY")
+        if or_key and not or_key.startswith("sk-or-v1-your") and _allowed("openrouter"):
+            return BackendConfig(
+                backend_type=BackendType.OPENROUTER, model_id=model_id,
+                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                api_key=or_key,
+                extra_headers={"HTTP-Referer": "https://security-harness.local", "X-Title": "LLM-Security-Harness"},
+            )
+        return None
+
+    def _anthropic_config(model_id: str) -> BackendConfig | None:
+        key = os.getenv("ANTHROPIC_API_KEY")
+        if key and not key.startswith("sk-ant-your") and _allowed("anthropic"):
+            return BackendConfig(backend_type=BackendType.ANTHROPIC, model_id=model_id, api_key=key)
+        return None
+
+    def _nvidia_config(model_id: str) -> BackendConfig | None:
+        nv_key = os.getenv("NVIDIA_API_KEY")
+        if nv_key and not nv_key.startswith("nvapi-your") and _allowed("nvidia"):
+            return BackendConfig(
+                backend_type=BackendType.NVIDIA, model_id=model_id,
+                base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+                api_key=nv_key,
+            )
+        return None
+
+    def _copilot_config(model_id: str) -> BackendConfig | None:
+        copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if copilot_key and _allowed("copilot"):
+            return BackendConfig(
+                backend_type=BackendType.COPILOT, model_id=model_id,
+                base_url=os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com"),
+                api_key=copilot_key,
+                extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+            )
+        return None
+
     configs = []
     for model_id in model_ids:
         mid = model_id.lower()
-        # Heuristic: match model ID to backend.
-        if "claude" in mid or "anthropic" in mid:
-            key = os.getenv("ANTHROPIC_API_KEY")
-            if key and not key.startswith("sk-ant-your"):
-                configs.append(BackendConfig(
-                    backend_type=BackendType.ANTHROPIC,
-                    model_id=model_id,
-                    api_key=key,
-                ))
-                continue
-        if "gpt" in mid or "o1" in mid or "o3" in mid:
-            # Try Copilot first, then OpenRouter.
-            copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
-            if copilot_key and (not backends or "copilot" in backends):
-                configs.append(BackendConfig(
-                    backend_type=BackendType.COPILOT,
-                    model_id=model_id,
-                    base_url=os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com"),
-                    api_key=copilot_key,
-                    extra_headers={"Copilot-Integration-Id": "vscode-chat"},
-                ))
-                continue
-        if "gemini" in mid or "llama" in mid or "mistral" in mid or "/" in mid:
-            or_key = os.getenv("OPENROUTER_API_KEY")
-            if or_key and not or_key.startswith("sk-or-v1-your"):
-                configs.append(BackendConfig(
-                    backend_type=BackendType.OPENROUTER,
-                    model_id=model_id,
-                    base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
-                    api_key=or_key,
-                    extra_headers={"HTTP-Referer": "https://security-harness.local", "X-Title": "LLM-Security-Harness"},
-                ))
-                continue
-        if "glm" in mid or "nvidia" in mid:
-            nv_key = os.getenv("NVIDIA_API_KEY")
-            if nv_key and not nv_key.startswith("nvapi-your"):
-                configs.append(BackendConfig(
-                    backend_type=BackendType.NVIDIA,
-                    model_id=model_id,
-                    base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
-                    api_key=nv_key,
-                ))
-                continue
-        # Fallback: try Anthropic if key is set.
-        key = os.getenv("ANTHROPIC_API_KEY")
-        if key and not key.startswith("sk-ant-your"):
-            configs.append(BackendConfig(
-                backend_type=BackendType.ANTHROPIC,
-                model_id=model_id,
-                api_key=key,
-            ))
+        config = None
+
+        # If model ID contains a slash (e.g. anthropic/claude-sonnet-4), route to OpenRouter.
+        if "/" in mid:
+            config = _or_config(model_id)
+        elif "claude" in mid:
+            config = _anthropic_config(model_id) or _or_config(model_id)
+        elif "gpt" in mid or "o1" in mid or "o3" in mid:
+            config = _copilot_config(model_id) or _or_config(model_id)
+        elif "gemini" in mid or "llama" in mid or "mistral" in mid:
+            config = _or_config(model_id)
+        elif "glm" in mid:
+            config = _nvidia_config(model_id) or _or_config(model_id)
+
+        # Fallback: try each backend in priority order.
+        if not config:
+            config = (_or_config(model_id) or _anthropic_config(model_id) or
+                      _nvidia_config(model_id) or _copilot_config(model_id))
+
+        if config:
+            configs.append(config)
         else:
             print(f"Warning: no backend found for model {model_id}", file=sys.stderr)
     return configs

@@ -224,11 +224,7 @@ Based on the validator output, classify this finding."""
 
     start = time.monotonic()
     try:
-        response = client.send_prompt(
-            config=backend_config,
-            prompt=prompt,
-            system_prompt=SYSTEM_PROMPT,
-        )
+        response = client.chat(config=backend_config, system=SYSTEM_PROMPT, user=prompt)
         latency = (time.monotonic() - start) * 1000
 
         content = response.content.strip()

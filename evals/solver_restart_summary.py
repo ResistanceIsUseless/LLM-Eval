@@ -282,11 +282,7 @@ Produce a restart summary for the next session."""
 
     start = time.monotonic()
     try:
-        response = client.send_prompt(
-            config=backend_config,
-            prompt=prompt,
-            system_prompt=system,
-        )
+        response = client.chat(config=backend_config, system=system, user=prompt)
         latency = (time.monotonic() - start) * 1000
         summary = response.content.strip()
     except Exception as e:
@@ -320,10 +316,10 @@ def judge_summary(result: SolverSummaryResult, challenge: SolverSessionChallenge
     )
 
     try:
-        response = client.send_prompt(
+        response = client.chat(
             config=judge_config,
-            prompt=prompt,
-            system_prompt="You are an expert evaluator of security engagement summaries.",
+            system="You are an expert evaluator of security engagement summaries.",
+            user=prompt,
         )
         content = response.content.strip()
         if content.startswith("```"):

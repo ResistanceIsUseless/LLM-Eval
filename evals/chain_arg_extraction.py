@@ -246,11 +246,7 @@ def evaluate_challenge(challenge: ChainArgChallenge, model_id: str,
 
     start = time.monotonic()
     try:
-        response = client.send_prompt(
-            config=backend_config,
-            prompt=prompt,
-            system_prompt=system,
-        )
+        response = client.chat(config=backend_config, system=system, user=prompt)
         latency = (time.monotonic() - start) * 1000
 
         content = response.content.strip()
