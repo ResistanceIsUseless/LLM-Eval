@@ -3470,6 +3470,108 @@ def build_backend_configs(args) -> tuple[list[BackendConfig], BackendConfig]:
     return configs, judge_config
 
 
+def build_backend_configs_for_models(model_ids: list[str],
+                                     backends: list[str] | None = None) -> list[BackendConfig]:
+    """Build BackendConfigs for specific model IDs (used by standalone evals).
+
+    Tries each configured backend to find a matching model. Returns one
+    BackendConfig per model ID that has a reachable backend.
+    """
+    configs = []
+    for model_id in model_ids:
+        mid = model_id.lower()
+        # Heuristic: match model ID to backend.
+        if "claude" in mid or "anthropic" in mid:
+            key = os.getenv("ANTHROPIC_API_KEY")
+            if key and not key.startswith("sk-ant-your"):
+                configs.append(BackendConfig(
+                    backend_type=BackendType.ANTHROPIC,
+                    model_id=model_id,
+                    api_key=key,
+                ))
+                continue
+        if "gpt" in mid or "o1" in mid or "o3" in mid:
+            # Try Copilot first, then OpenRouter.
+            copilot_key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+            if copilot_key and (not backends or "copilot" in backends):
+                configs.append(BackendConfig(
+                    backend_type=BackendType.COPILOT,
+                    model_id=model_id,
+                    base_url=os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com"),
+                    api_key=copilot_key,
+                    extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+                ))
+                continue
+        if "gemini" in mid or "llama" in mid or "mistral" in mid or "/" in mid:
+            or_key = os.getenv("OPENROUTER_API_KEY")
+            if or_key and not or_key.startswith("sk-or-v1-your"):
+                configs.append(BackendConfig(
+                    backend_type=BackendType.OPENROUTER,
+                    model_id=model_id,
+                    base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                    api_key=or_key,
+                    extra_headers={"HTTP-Referer": "https://security-harness.local", "X-Title": "LLM-Security-Harness"},
+                ))
+                continue
+        if "glm" in mid or "nvidia" in mid:
+            nv_key = os.getenv("NVIDIA_API_KEY")
+            if nv_key and not nv_key.startswith("nvapi-your"):
+                configs.append(BackendConfig(
+                    backend_type=BackendType.NVIDIA,
+                    model_id=model_id,
+                    base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+                    api_key=nv_key,
+                ))
+                continue
+        # Fallback: try Anthropic if key is set.
+        key = os.getenv("ANTHROPIC_API_KEY")
+        if key and not key.startswith("sk-ant-your"):
+            configs.append(BackendConfig(
+                backend_type=BackendType.ANTHROPIC,
+                model_id=model_id,
+                api_key=key,
+            ))
+        else:
+            print(f"Warning: no backend found for model {model_id}", file=sys.stderr)
+    return configs
+
+
+def build_judge_config() -> BackendConfig | None:
+    """Build a judge BackendConfig from environment variables."""
+    judge_backend = os.getenv("JUDGE_BACKEND", "anthropic")
+    judge_model = os.getenv("JUDGE_MODEL", "claude-opus-4-20250514")
+
+    if judge_backend == "anthropic":
+        key = os.getenv("ANTHROPIC_API_KEY")
+        if key and not key.startswith("sk-ant-your"):
+            return BackendConfig(backend_type=BackendType.ANTHROPIC, model_id=judge_model, api_key=key)
+    elif judge_backend == "copilot":
+        key = os.getenv("GITHUB_COPILOT_TOKEN") or os.getenv("GITHUB_TOKEN")
+        if key:
+            return BackendConfig(
+                backend_type=BackendType.COPILOT, model_id=judge_model,
+                base_url=os.getenv("COPILOT_BASE_URL", "https://api.githubcopilot.com"),
+                api_key=key, extra_headers={"Copilot-Integration-Id": "vscode-chat"},
+            )
+    elif judge_backend == "openrouter":
+        key = os.getenv("OPENROUTER_API_KEY")
+        if key and not key.startswith("sk-or-v1-your"):
+            return BackendConfig(
+                backend_type=BackendType.OPENROUTER, model_id=judge_model,
+                base_url=os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                api_key=key, extra_headers={"HTTP-Referer": "https://security-harness.local", "X-Title": "LLM-Security-Harness"},
+            )
+    elif judge_backend == "nvidia":
+        key = os.getenv("NVIDIA_API_KEY")
+        if key and not key.startswith("nvapi-your"):
+            return BackendConfig(
+                backend_type=BackendType.NVIDIA, model_id=judge_model,
+                base_url=os.getenv("NVIDIA_BASE_URL", "https://integrate.api.nvidia.com/v1"),
+                api_key=key,
+            )
+    return None
+
+
 def _probe_cloud_model(config: BackendConfig, client: LLMClient) -> dict:
     """
     Send a minimal chat request to a cloud backend to verify it is reachable
@@ -4753,6 +4855,59 @@ Examples:
         help="Limit leaderboard to the last N runs (default: all)"
     )
 
+    # --- emit-profiles ---
+    emit_parser = subparsers.add_parser(
+        "emit-profiles", help="Generate profiles.yaml from benchmark results"
+    )
+    emit_parser.add_argument("--scores-db", default="results/scores.db")
+    emit_parser.add_argument("--results-dir", default="results")
+    emit_parser.add_argument("--out", default="-", help="Output path (- for stdout)")
+
+    # --- eval-xbow ---
+    xbow_parser = subparsers.add_parser(
+        "eval-xbow", help="Run XBOW validation benchmark"
+    )
+    xbow_parser.add_argument("--models", nargs="+", required=True)
+    xbow_parser.add_argument("--challenges-dir", default="data/xbow")
+    xbow_parser.add_argument("--results-dir", default="results")
+    xbow_parser.add_argument("--backends", nargs="+")
+
+    # --- eval-airtbench ---
+    airtbench_parser = subparsers.add_parser(
+        "eval-airtbench", help="Run AIRTBench alignment benchmark"
+    )
+    airtbench_parser.add_argument("--models", nargs="+", required=True)
+    airtbench_parser.add_argument("--dataset", default="data/airtbench")
+    airtbench_parser.add_argument("--results-dir", default="results")
+    airtbench_parser.add_argument("--backends", nargs="+")
+
+    # --- eval-chain-args ---
+    chain_parser = subparsers.add_parser(
+        "eval-chain-args", help="Run chain-argument extraction eval"
+    )
+    chain_parser.add_argument("--models", nargs="+", required=True)
+    chain_parser.add_argument("--challenges-dir", default="data/chain_arg")
+    chain_parser.add_argument("--results-dir", default="results")
+    chain_parser.add_argument("--backends", nargs="+")
+
+    # --- eval-finding-judgment ---
+    finding_parser = subparsers.add_parser(
+        "eval-finding-judgment", help="Run finding validation judgment eval"
+    )
+    finding_parser.add_argument("--models", nargs="+", required=True)
+    finding_parser.add_argument("--challenges-dir", default="data/finding_validation")
+    finding_parser.add_argument("--results-dir", default="results")
+    finding_parser.add_argument("--backends", nargs="+")
+
+    # --- eval-solver-summary ---
+    solver_parser = subparsers.add_parser(
+        "eval-solver-summary", help="Run solver restart summary eval"
+    )
+    solver_parser.add_argument("--models", nargs="+", required=True)
+    solver_parser.add_argument("--challenges-dir", default="data/solver_sessions")
+    solver_parser.add_argument("--results-dir", default="results")
+    solver_parser.add_argument("--backends", nargs="+")
+
     args = parser.parse_args()
 
     if not args.command:
@@ -4771,6 +4926,31 @@ Examples:
         cmd_report(args)
     elif args.command == "history":
         cmd_history(args)
+    elif args.command == "emit-profiles":
+        from scripts.emit_profiles import main as emit_profiles_main
+        sys.argv = ["emit_profiles", "--scores-db", args.scores_db,
+                     "--results-dir", args.results_dir, "--out", args.out]
+        emit_profiles_main()
+    elif args.command == "eval-xbow":
+        from evals.xbow_validation import run_xbow_eval
+        run_xbow_eval(args.models, args.challenges_dir, args.results_dir,
+                      getattr(args, 'backends', None))
+    elif args.command == "eval-airtbench":
+        from evals.airtbench_alignment import run_airtbench_eval
+        run_airtbench_eval(args.models, args.dataset, args.results_dir,
+                           getattr(args, 'backends', None))
+    elif args.command == "eval-chain-args":
+        from evals.chain_arg_extraction import run_chain_arg_eval
+        run_chain_arg_eval(args.models, args.challenges_dir, args.results_dir,
+                           getattr(args, 'backends', None))
+    elif args.command == "eval-finding-judgment":
+        from evals.finding_validation_judgment import run_finding_judgment_eval
+        run_finding_judgment_eval(args.models, args.challenges_dir, args.results_dir,
+                                  getattr(args, 'backends', None))
+    elif args.command == "eval-solver-summary":
+        from evals.solver_restart_summary import run_solver_summary_eval
+        run_solver_summary_eval(args.models, args.challenges_dir, args.results_dir,
+                                getattr(args, 'backends', None))
 
 
 if __name__ == "__main__":
